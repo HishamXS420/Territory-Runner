@@ -38,3 +38,30 @@
   color: #2980b9;
 }
 
+.feedback {
+  margin: 0 1rem 1rem;
+}
+
+.feedback .success,
+.feedback .info {
+  border-radius: 8px;
+  padding: 0.9rem;
+  border: 1px solid transparent;
+}
+
+.feedback .success {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.feedback .info {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1e3a8a;
+}
+
+.feedback p {
+  margin: 0.2rem 0;
+}
+

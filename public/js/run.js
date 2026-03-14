@@ -9,6 +9,8 @@ let distance = 0;
 let polylineLayer;
 let marker = null;  // Current location marker
 let route = [];     // Array to store route points
+let completionLayer;
+let timerIntervalId;
 
 // Initialize map on page load
 function initializeMap() {
@@ -174,6 +176,73 @@ function pauseRun() {
   pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
 }
 
+function renderCompletedRunOnMap(isClosedLoop) {
+  if (!route.length) {
+    return;
+  }
+
+  if (polylineLayer) {
+    polylineLayer.setStyle({
+      color: '#2563eb',
+      weight: 4,
+      opacity: 0.95,
+    });
+  }
+
+  if (completionLayer) {
+    map.removeLayer(completionLayer);
+  }
+
+  if (isClosedLoop && route.length >= 3) {
+    completionLayer = L.polygon(route, {
+      color: '#16a34a',
+      fillColor: '#22c55e',
+      fillOpacity: 0.25,
+      weight: 3,
+    }).addTo(map);
+  }
+
+  const bounds = L.latLngBounds(route);
+  if (bounds.isValid()) {
+    map.fitBounds(bounds.pad(0.2));
+  }
+}
+
+function showCompletionSummary(runData) {
+  const feedback = document.getElementById('session-feedback');
+  const finalDistance = Number(runData?.stats?.distance || 0).toFixed(2);
+  const finalArea = Number(runData?.territoryArea || 0).toFixed(2);
+
+  if (runData.isClosedLoop) {
+    feedback.innerHTML = `
+      <div class="success">
+        <p><strong>✓ Territory Captured!</strong></p>
+        <p>Covered Area: ${finalArea} m²</p>
+        <p>Your captured shape is now highlighted on the map.</p>
+      </div>
+    `;
+    return;
+  }
+
+  feedback.innerHTML = `
+    <div class="info">
+      <p><strong>✓ Route Saved</strong></p>
+      <p>Walked Distance: ${finalDistance} km</p>
+      <p>Your completed route is highlighted on the map.</p>
+    </div>
+  `;
+}
+
+function setFinalMeasurements(runData) {
+  const finalTime = Number(runData?.session?.total_time || 0);
+  const finalDistance = Number(runData?.stats?.distance || 0);
+  const finalCalories = Number(runData?.stats?.calories || 0);
+
+  document.getElementById('time').textContent = formatTime(finalTime);
+  document.getElementById('distance').textContent = `${finalDistance.toFixed(2)} km`;
+  document.getElementById('calories').textContent = String(finalCalories);
+}
+
 // Finish running session
 async function finishRun() {
   isRunning = false;
@@ -184,26 +253,17 @@ async function finishRun() {
       headers: { Authorization: `Bearer ${getToken()}` }
     });
 
-    const feedback = document.getElementById('session-feedback');
-    if (response.data.isClosedLoop) {
-      feedback.innerHTML = `
-        <div class="success">
-          <p>✓ Territory Captured!</p>
-          <p>Area: ${response.data.territoryArea} m²</p>
-        </div>
-      `;
-    } else {
-      feedback.innerHTML = '<div class="info"><p>Run completed! Distance: ' + response.data.stats.distance.toFixed(2) + ' km</p></div>';
+    if (timerIntervalId) {
+      clearInterval(timerIntervalId);
     }
+
+    setFinalMeasurements(response.data);
+    showCompletionSummary(response.data);
+    renderCompletedRunOnMap(response.data.isClosedLoop);
 
     // Disable buttons after finishing
     document.getElementById('pause-btn').disabled = true;
     document.getElementById('finish-btn').disabled = true;
-
-    // Redirect to home after 2 seconds
-    setTimeout(() => {
-      location.href = '/';
-    }, 2000);
   } catch (error) {
     console.error('Error finishing run:', error);
     alert('Error finishing run: ' + (error.response?.data?.message || error.message));
@@ -237,7 +297,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     startTracking();
 
     // Update display every second
-    setInterval(updateDisplay, 1000);
+    timerIntervalId = setInterval(updateDisplay, 1000);
   } catch (error) {
     console.error('Error starting session:', error);
     const status = error.response?.status;
