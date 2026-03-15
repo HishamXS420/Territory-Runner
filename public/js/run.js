@@ -4,11 +4,15 @@ let sessionId;
 let isRunning = true;
 let isPaused = false;
 let startTime;
+let totalPausedTime = 0;
+let pauseStartTime = null;
 let coordinates = [];
 let distance = 0;
 let polylineLayer;
 let marker = null;  // Current location marker
-let route = [];     // Array to store route points
+let routeSegments = []; // Array of arrays for multiple path segments (separated by pauses)
+let currentSegment = []; // The current active path segment
+routeSegments.push(currentSegment);
 let completionLayer;
 let timerIntervalId;
 
@@ -24,7 +28,7 @@ function initializeMap() {
   }).addTo(map);
 
   // Initialize polyline for route
-  polylineLayer = L.polyline(route, { color: 'blue', weight: 3 }).addTo(map);
+  polylineLayer = L.polyline(routeSegments, { color: 'blue', weight: 3 }).addTo(map);
 
   // Get user's current location
   if (navigator.geolocation) {
@@ -71,10 +75,10 @@ function startTracking() {
       const lon = position.coords.longitude;
 
       coordinates.push([lat, lon]);
-      route.push([lat, lon]);
+      currentSegment.push([lat, lon]);
 
       // Update polyline with new point
-      polylineLayer.setLatLngs(route);
+      polylineLayer.setLatLngs(routeSegments);
 
       // Update or create marker at current position
       if (marker) {
@@ -124,7 +128,11 @@ function startTracking() {
 
 // Update display (distance, time, calories)
 function updateDisplay() {
-  const elapsedTime = Math.floor((Date.now() - startTime) / 1000);
+  let effectivePause = totalPausedTime;
+  if (isPaused && pauseStartTime) {
+    effectivePause += (Date.now() - pauseStartTime);
+  }
+  const elapsedTime = Math.floor((Date.now() - startTime - effectivePause) / 1000);
   document.getElementById('time').textContent = formatTime(elapsedTime);
 
   // Calculate distance from coordinates
@@ -140,6 +148,8 @@ function updateDisplay() {
 function calculateDistance(coords) {
   let totalDistance = 0;
   for (let i = 0; i < coords.length - 1; i++) {
+    // Skip calculation across pauses (marked by 999)
+    if (coords[i][0] === 999 || coords[i + 1][0] === 999) continue;
     totalDistance += getDistance(coords[i], coords[i + 1]);
   }
   return totalDistance;
@@ -170,14 +180,46 @@ function formatTime(seconds) {
 }
 
 // Pause running session
-function pauseRun() {
+async function pauseRun() {
   isPaused = !isPaused;
   const pauseBtn = document.getElementById('pause-btn');
   pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+
+  if (isPaused) {
+    pauseStartTime = Date.now();
+    // Break the polyline visually by creating a new segment
+    currentSegment = [];
+    routeSegments.push(currentSegment);
+
+    // Record a 999,999 breakpoint to suspend distance calculations across the gap
+    coordinates.push([999, 999]);
+
+    if (sessionId) {
+      try {
+        await axios.post(`/api/run/${sessionId}/coordinate`, 
+          { latitude: 999, longitude: 999 },
+          { headers: { Authorization: `Bearer ${getToken()}` } }
+        );
+      } catch (error) {
+        console.error('Error sending break coordinate:', error);
+      }
+    }
+  } else {
+    // Resuming
+    if (pauseStartTime) {
+      totalPausedTime += (Date.now() - pauseStartTime);
+      pauseStartTime = null;
+    }
+  }
 }
 
 function renderCompletedRunOnMap(isClosedLoop) {
-  if (!route.length) {
+  const flattenedRoute = [];
+  routeSegments.forEach(seg => {
+    seg.forEach(pt => flattenedRoute.push(pt));
+  });
+
+  if (!flattenedRoute.length) {
     return;
   }
 
@@ -193,8 +235,8 @@ function renderCompletedRunOnMap(isClosedLoop) {
     map.removeLayer(completionLayer);
   }
 
-  if (isClosedLoop && route.length >= 3) {
-    completionLayer = L.polygon(route, {
+  if (isClosedLoop && flattenedRoute.length >= 3) {
+    completionLayer = L.polygon(flattenedRoute, {
       color: '#16a34a',
       fillColor: '#22c55e',
       fillOpacity: 0.25,
@@ -202,7 +244,7 @@ function renderCompletedRunOnMap(isClosedLoop) {
     }).addTo(map);
   }
 
-  const bounds = L.latLngBounds(route);
+  const bounds = L.latLngBounds(flattenedRoute);
   if (bounds.isValid()) {
     map.fitBounds(bounds.pad(0.2));
   }
