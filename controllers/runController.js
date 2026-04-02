@@ -1,6 +1,8 @@
-const RunningSession = require('../models/RunningSession');
+﻿const RunningSession = require('../models/RunningSession');
 const RouteCoordinate = require('../models/RouteCoordinate');
-const pool = require('../config/database');
+const User = require('../models/User');
+const UserStatistics = require('../models/UserStatistics');
+const Territory = require('../models/Territory');
 const geoUtils = require('../utils/geoUtils');
 const { handleTerritoryOverlap } = require('../utils/territoryOverlapHandler');
 
@@ -9,16 +11,25 @@ exports.startSession = async (req, res) => {
   try {
     const userId = req.user.id;
 
+    console.log('🏃 Starting running session for user:', userId);
+
     // Create new running session
-    const session = await RunningSession.create(userId);
+    const session = new RunningSession({
+      userId: userId,
+      startTime: new Date(),
+    });
+
+    const savedSession = await session.save();
+
+    console.log('✅ Running session started:', savedSession._id);
 
     res.status(201).json({
       message: 'Running session started.',
-      sessionId: session.id,
-      startTime: session.start_time,
+      sessionId: savedSession._id,
+      startTime: savedSession.startTime,
     });
   } catch (error) {
-    console.error('Error starting session:', error);
+    console.error('❌ Error starting session:', error.message);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
@@ -30,17 +41,34 @@ exports.addCoordinate = async (req, res) => {
     const { latitude, longitude } = req.body;
     const userId = req.user.id;
 
+    console.log('📍 Recording coordinate for session:', sessionId, { latitude, longitude });
+
     // Validate input
     if (latitude === undefined || latitude === null || longitude === undefined || longitude === null) {
       return res.status(400).json({ message: 'Latitude and longitude are required.' });
     }
 
-    // Create coordinate record
-    const coordinate = await RouteCoordinate.create(sessionId, latitude, longitude);
+    // Verify session exists
+    const session = await RunningSession.findById(sessionId);
+    if (!session) {
+      return res.status(404).json({ message: 'Session not found.' });
+    }
 
-    res.json({ message: 'Coordinate recorded.', coordinate });
+    // Create coordinate record
+    const coordinate = new RouteCoordinate({
+      runningSessionId: sessionId,
+      latitude: latitude,
+      longitude: longitude,
+      recordedAt: new Date(),
+    });
+
+    const savedCoordinate = await coordinate.save();
+
+    console.log('✅ Coordinate recorded:', savedCoordinate._id);
+
+    res.json({ message: 'Coordinate recorded.', coordinate: savedCoordinate });
   } catch (error) {
-    console.error('Error adding coordinate:', error);
+    console.error('❌ Error adding coordinate:', error.message);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
@@ -50,10 +78,20 @@ exports.pauseSession = async (req, res) => {
   try {
     const { sessionId } = req.params;
 
+    console.log('⏸️ Pausing session:', sessionId);
+
+    // Verify session exists
+    const session = await RunningSession.findById(sessionId);
+    if (!session) {
+      return res.status(404).json({ message: 'Session not found.' });
+    }
+
+    console.log('✅ Session paused');
+
     // Session still exists but tracking is paused (client-side)
     res.json({ message: 'Session paused.' });
   } catch (error) {
-    console.error('Error pausing session:', error);
+    console.error('❌ Error pausing session:', error.message);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
@@ -64,25 +102,36 @@ exports.finishSession = async (req, res) => {
     const { sessionId } = req.params;
     const userId = req.user.id;
 
+    console.log('🏁 Finishing session:', sessionId, 'for user:', userId);
+
     // Get the session
     const session = await RunningSession.findById(sessionId);
     if (!session) {
+      console.log('❌ Session not found:', sessionId);
       return res.status(404).json({ message: 'Session not found.' });
     }
 
     // Get all coordinates for this session
-    const coordinateRows = await RouteCoordinate.getBySessionId(sessionId);
+    const coordinateRows = await RouteCoordinate.find({ runningSessionId: sessionId })
+      .sort({ recordedAt: 1 })
+      .lean();
+
     if (!coordinateRows || coordinateRows.length === 0) {
+      console.log('⚠️ No coordinates recorded for session:', sessionId);
       return res.status(400).json({ message: 'No coordinates recorded for this session.' });
     }
+
+    console.log('📊 Total coordinates recorded:', coordinateRows.length);
 
     // Convert to coordinate array [lat, lon]
     const coordinates = coordinateRows.map(row => [row.latitude, row.longitude]);
 
     // Calculate stats
     const endTime = new Date();
-    const timeInSeconds = Math.floor((endTime - session.start_time) / 1000);
+    const timeInSeconds = Math.floor((endTime - session.startTime) / 1000);
     const stats = geoUtils.calculateRunningStats(coordinates, timeInSeconds);
+
+    console.log('📈 Stats calculated:', { distance: stats.distance, time: timeInSeconds, calories: stats.calories });
 
     let territoryId = null;
     let territoryArea = 0;
@@ -94,13 +143,16 @@ exports.finishSession = async (req, res) => {
       // Check if it's a closed loop
       isClosedLoop = geoUtils.isClosedLoop(coordinates);
 
+      console.log('🔄 Closed loop check:', isClosedLoop);
+
       if (isClosedLoop) {
         try {
           const polygon = geoUtils.coordinatesToPolygon(coordinates);
           territoryArea = geoUtils.calculateArea(polygon);
           centerPoint = geoUtils.calculateCenterPoint(polygon);
+          console.log('🗺️ Territory detected - Area:', territoryArea, 'Center:', centerPoint);
         } catch (error) {
-          console.error('Error preparing territory geometry:', error);
+          console.error('⚠️ Error preparing territory geometry:', error.message);
           isClosedLoop = false;
           territoryArea = 0;
           centerPoint = null;
@@ -110,78 +162,69 @@ exports.finishSession = async (req, res) => {
 
     let updatedSession;
     let createdTerritory = null;
-    const client = await pool.connect();
 
     try {
-      await client.query('BEGIN');
-
-      // 1) Save final running session snapshot
-      const updatedSessionResult = await client.query(
-        `UPDATE running_sessions
-         SET end_time = $2, is_closed_loop = $3, total_distance = $4, total_time = $5, estimated_calories = $6
-         WHERE id = $1
-         RETURNING *`,
-        [sessionId, endTime, isClosedLoop, stats.distance, timeInSeconds, stats.calories]
-      );
-      updatedSession = updatedSessionResult.rows[0];
-
-      // 2) Save running aggregates
-      await client.query(
-        `INSERT INTO user_statistics (
-           user_id,
-           total_distance,
-           total_time,
-           total_calories,
-           total_territory_area,
-           total_running_sessions,
-           updated_at
-         )
-         VALUES ($1, $2, $3, $4, 0, 1, NOW())
-         ON CONFLICT (user_id) DO UPDATE
-         SET total_distance = user_statistics.total_distance + EXCLUDED.total_distance,
-             total_time = user_statistics.total_time + EXCLUDED.total_time,
-             total_calories = user_statistics.total_calories + EXCLUDED.total_calories,
-             total_running_sessions = user_statistics.total_running_sessions + 1,
-             updated_at = NOW()`,
-        [userId, stats.distance * 1000, timeInSeconds, stats.calories]
+      // 1) Update running session with final stats
+      updatedSession = await RunningSession.findByIdAndUpdate(
+        sessionId,
+        {
+          endTime: endTime,
+          isClosedLoop: isClosedLoop,
+          totalDistance: stats.distance,
+          totalTime: timeInSeconds,
+          estimatedCalories: stats.calories,
+        },
+        { new: true }
       );
 
-      // 3) Save territory + territory area aggregate if loop is closed
-      if (isClosedLoop && territoryArea > 0 && centerPoint) {
-        const territoryResult = await client.query(
-          `INSERT INTO territories (user_id, running_session_id, polygon_coords, area, center_lat, center_lon)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING *`,
-          [userId, sessionId, JSON.stringify(coordinates), territoryArea, centerPoint.lat, centerPoint.lon]
-        );
+      console.log('✅ Session updated with stats');
 
-        createdTerritory = territoryResult.rows[0];
-        territoryId = createdTerritory.id;
+      // 2) Update user statistics (running aggregates)
+      let userStats = await UserStatistics.findOne({ userId: userId });
 
-        await client.query(
-          `INSERT INTO user_statistics (
-             user_id,
-             total_distance,
-             total_time,
-             total_calories,
-             total_territory_area,
-             total_running_sessions,
-             updated_at
-           )
-           VALUES ($1, 0, 0, 0, $2, 0, NOW())
-           ON CONFLICT (user_id) DO UPDATE
-           SET total_territory_area = user_statistics.total_territory_area + EXCLUDED.total_territory_area,
-               updated_at = NOW()`,
-          [userId, territoryArea]
-        );
+      if (!userStats) {
+        // Create if not exists
+        userStats = new UserStatistics({
+          userId: userId,
+          totalDistance: stats.distance,
+          totalTime: timeInSeconds,
+          totalCalories: stats.calories,
+          totalRunningSessions: 1,
+        });
+      } else {
+        // Update existing
+        userStats.totalDistance += stats.distance;
+        userStats.totalTime += timeInSeconds;
+        userStats.totalCalories += stats.calories;
+        userStats.totalRunningSessions += 1;
       }
 
-      await client.query('COMMIT');
-    } catch (transactionError) {
-      await client.query('ROLLBACK');
-      throw transactionError;
-    } finally {
-      client.release();
+      await userStats.save();
+      console.log('✅ User statistics updated');
+
+      // 3) Save territory if loop is closed
+      if (isClosedLoop && territoryArea > 0 && centerPoint) {
+        createdTerritory = new Territory({
+          userId: userId,
+          runningSessionId: sessionId,
+          polygonCoords: coordinates,
+          area: territoryArea,
+          centerLat: centerPoint.lat,
+          centerLon: centerPoint.lon,
+        });
+
+        await createdTerritory.save();
+        territoryId = createdTerritory._id;
+
+        // Update territory area in user statistics
+        userStats.totalTerritoryArea += territoryArea;
+        await userStats.save();
+
+        console.log('✅ Territory created:', territoryId, 'Area:', territoryArea);
+      }
+    } catch (error) {
+      console.error('❌ Error during session finish:', error.message);
+      throw error;
     }
 
     // Handle overlap after successful core transaction (non-blocking)
@@ -189,26 +232,23 @@ exports.finishSession = async (req, res) => {
       try {
         await handleTerritoryOverlap(createdTerritory, userId);
       } catch (overlapError) {
-        console.error('Territory overlap post-processing failed:', overlapError);
+        console.error('⚠️ Territory overlap post-processing failed:', overlapError.message);
       }
     }
+
+    console.log('✅ Session finish complete');
 
     res.json({
       message: 'Session finished.',
       session: updatedSession,
       stats,
       isClosedLoop,
-      territoryId,
-      territoryArea: territoryArea.toFixed(2),
+      territoryCreated: !!createdTerritory,
+      territoryId: territoryId,
+      territoryArea: territoryArea,
     });
   } catch (error) {
-    console.error('Error finishing session:', error);
-    console.error('Error details:', {
-      message: error.message,
-      stack: error.stack,
-      userId: req.user?.id,
-      sessionId: req.params?.sessionId
-    });
+    console.error('❌ Error finishing session:', error.message);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
@@ -218,16 +258,23 @@ exports.getSession = async (req, res) => {
   try {
     const { sessionId } = req.params;
 
+    console.log('🔍 Fetching session details:', sessionId);
+
     const session = await RunningSession.findById(sessionId);
     if (!session) {
+      console.log('❌ Session not found:', sessionId);
       return res.status(404).json({ message: 'Session not found.' });
     }
 
-    const coordinates = await RouteCoordinate.getBySessionId(sessionId);
+    const coordinates = await RouteCoordinate.find({ runningSessionId: sessionId })
+      .sort({ recordedAt: 1 })
+      .lean();
+
+    console.log('✅ Session details fetched');
 
     res.json({ session, coordinates });
   } catch (error) {
-    console.error('Error fetching session:', error);
+    console.error('❌ Error fetching session:', error.message);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
@@ -237,11 +284,18 @@ exports.getRunHistory = async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const sessions = await RunningSession.getRecentSessionsWithTerritories(userId, 20);
+    console.log('📜 Fetching run history for user:', userId);
+
+    const sessions = await RunningSession.find({ userId: userId })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    console.log('✅ Run history fetched:', sessions.length, 'sessions');
 
     res.json({ sessions });
   } catch (error) {
-    console.error('Error fetching run history:', error);
+    console.error('❌ Error fetching run history:', error.message);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };

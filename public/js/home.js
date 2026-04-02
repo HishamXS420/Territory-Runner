@@ -19,12 +19,12 @@ async function loadUserProfile() {
     const response = await axios.get('/api/auth/profile', {
       headers: { Authorization: `Bearer ${getToken()}` }
     });
-    
+
     const { user, stats } = response.data;
     currentUserId = user?.id || null;
-    document.getElementById('total-distance').textContent = (stats.total_distance / 1000).toFixed(3);
-    document.getElementById('total-area').textContent = stats.total_territory_area.toFixed(3);
-    document.getElementById('total-calories').textContent = stats.total_calories;
+    document.getElementById('total-distance').textContent = (stats.totalDistance || stats.total_distance || 0).toFixed(3);
+    document.getElementById('total-area').textContent = (stats.totalTerritoryArea || stats.total_territory_area || 0).toFixed(3);
+    document.getElementById('total-calories').textContent = stats.totalCalories || stats.total_calories || 0;
   } catch (error) {
     console.error('Error loading profile:', error);
   }
@@ -39,14 +39,14 @@ async function loadRunHistory() {
 
     const sessions = response.data.sessions;
     const historyList = document.getElementById('history-list');
-    
+
     historyList.innerHTML = sessions.map(session => `
       <div class="history-item">
-        <p><strong>Date:</strong> ${new Date(session.start_time).toLocaleString()}</p>
-        <p><strong>Distance:</strong> ${session.total_distance.toFixed(2)} km</p>
-        <p><strong>Time:</strong> ${formatTime(session.total_time)}</p>
-        <p><strong>Calories:</strong> ${session.estimated_calories}</p>
-        ${session.territory_id ? `<p><strong>Territory Captured:</strong> ${(session.area / 1000000).toFixed(2)} km²</p>` : ''}
+        <p><strong>Date:</strong> ${new Date(session.startTime || session.start_time).toLocaleString()}</p>
+        <p><strong>Distance:</strong> ${((session.totalDistance || session.total_distance || 0)).toFixed(2)} km</p>
+        <p><strong>Time:</strong> ${formatTime(session.totalTime || session.total_time || 0)}</p>
+        <p><strong>Calories:</strong> ${session.estimatedCalories || session.estimated_calories || 0}</p>
+        ${session.isClosedLoop ? `<p><strong>Territory Captured ✅</strong></p>` : ''}
       </div>
     `).join('');
   } catch (error) {
@@ -79,7 +79,7 @@ function initializeTerritoryMap() {
 }
 
 function getTerritoryStyle(ownerId) {
-  const isOwnTerritory = currentUserId !== null && ownerId === currentUserId;
+  const isOwnTerritory = currentUserId !== null && String(ownerId) === String(currentUserId);
 
   return {
     color: isOwnTerritory ? '#2ecc71' : '#e74c3c',
@@ -103,20 +103,47 @@ async function loadTerritories() {
     const bounds = L.latLngBounds([]);
 
     territories.forEach((territory) => {
-      if (!Array.isArray(territory.polygon_coords) || territory.polygon_coords.length < 3) {
+      // Support both camelCase (Mongoose) and snake_case field names
+      const coords = territory.polygonCoords || territory.polygon_coords;
+      const ownerId = territory.userId?._id || territory.userId || territory.user_id;
+      const ownerName = territory.userId?.username || territory.username || 'Unknown';
+
+      if (!Array.isArray(coords) || coords.length < 3) {
         return;
       }
 
-      const polygon = L.polygon(territory.polygon_coords, getTerritoryStyle(territory.user_id))
+      const polygon = L.polygon(coords, getTerritoryStyle(String(ownerId)))
         .bindPopup(`
           <div>
-            <p><strong>Owner:</strong> ${territory.username || 'Unknown'}</p>
+            <p><strong>Owner:</strong> ${ownerName}</p>
             <p><strong>Area:</strong> ${Number(territory.area || 0).toFixed(2)} m²</p>
           </div>
         `);
 
       polygon.addTo(territoryLayerGroup);
       bounds.extend(polygon.getBounds());
+
+      // Place a username marker at the center of the territory
+      const centerLat = territory.centerLat || territory.center_lat;
+      const centerLon = territory.centerLon || territory.center_lon;
+      if (centerLat && centerLon) {
+        const label = L.divIcon({
+          className: '',
+          html: `<div style="
+            background: rgba(0,0,0,0.65);
+            color: #fff;
+            padding: 2px 7px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: nowrap;
+            pointer-events: none;
+          ">${ownerName}</div>`,
+          iconAnchor: [0, 0],
+        });
+        L.marker([centerLat, centerLon], { icon: label })
+          .addTo(territoryLayerGroup);
+      }
     });
 
     if (bounds.isValid()) {

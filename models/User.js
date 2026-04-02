@@ -1,45 +1,46 @@
-const pool = require('../config/database');
+const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
-class User {
-  // Create a new user
-  static async create(username, email, password) {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      'INSERT INTO users (username, email, password) VALUES ($1, $2, $3) RETURNING id, username, email',
-      [username, email, hashedPassword]
-    );
-    return result.rows[0];
-  }
+const userSchema = new mongoose.Schema(
+  {
+    username: {
+      type: String,
+      required: [true, 'Username is required'],
+      unique: true,
+      trim: true,
+      minlength: [3, 'Username must be at least 3 characters'],
+    },
+    email: {
+      type: String,
+      required: [true, 'Email is required'],
+      unique: true,
+      lowercase: true,
+      match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/, 'Please provide a valid email'],
+    },
+    password: {
+      type: String,
+      required: [true, 'Password is required'],
+      minlength: [6, 'Password must be at least 6 characters'],
+      select: false,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { timestamps: true }
+);
 
-  // Find user by email
-  static async findByEmail(email) {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    return result.rows[0];
+userSchema.pre('save', async function () {
+  if (!this.isModified('password')) {
+    return;
   }
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
+});
 
-  // Find user by ID
-  static async findById(id) {
-    const result = await pool.query('SELECT id, username, email, created_at FROM users WHERE id = $1', [id]);
-    return result.rows[0];
-  }
+userSchema.methods.comparePassword = async function (enteredPassword) {
+  return await bcrypt.compare(enteredPassword, this.password);
+};
 
-  // Find user by username
-  static async findByUsername(username) {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    return result.rows[0];
-  }
-
-  // Verify password
-  static async verifyPassword(password, hashedPassword) {
-    return await bcrypt.compare(password, hashedPassword);
-  }
-
-  // Get all users (for leaderboard)
-  static async getAllUsers() {
-    const result = await pool.query('SELECT id, username, created_at FROM users');
-    return result.rows;
-  }
-}
-
-module.exports = User;
+module.exports = mongoose.model('User', userSchema);

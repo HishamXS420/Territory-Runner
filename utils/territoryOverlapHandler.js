@@ -3,139 +3,88 @@ const UserStatistics = require('../models/UserStatistics');
 const geoUtils = require('./geoUtils');
 
 /**
- * Handle territory overlap when a new territory is created
- * This function processes overlaps and updates territories accordingly
- * 
- * @param {Object} newTerritory - The newly created territory
- * @param {number} newUserId - The user ID who created the new territory
+ * Handle territory overlap when a new territory is created.
+ * For each existing territory that overlaps:
+ *   - Subtract the overlapping region from the old owner's polygon & stats
+ *   - The new territory already contains the full area (no extra addition needed)
+ *
+ * @param {Object} newTerritory - The newly saved Mongoose Territory document
+ * @param {string} newUserId    - The ObjectId string of the user who created it
  */
 async function handleTerritoryOverlap(newTerritory, newUserId) {
   try {
-    // Parse the new territory's polygon
-    const newPolygon = geoUtils.coordinatesToPolygon(newTerritory.polygon_coords);
+    const newPolygon = geoUtils.coordinatesToPolygon(newTerritory.polygonCoords);
 
-    // Get all existing territories
-    const allTerritories = await Territory.getAll();
+    // Fetch all territories EXCEPT the one just created
+    const allTerritories = await Territory.find({
+      _id: { $ne: newTerritory._id },
+    }).lean();
 
-    // Check for overlaps with each existing territory
-    for (const existingTerritory of allTerritories) {
-      // Skip if it's the same territory
-      if (existingTerritory.id === newTerritory.id) continue;
+    for (const existing of allTerritories) {
+      // Skip territories owned by the same user
+      if (String(existing.userId) === String(newUserId)) continue;
 
-      // Parse existing territory's polygon
-      const existingPolygon = geoUtils.coordinatesToPolygon(
-        JSON.parse(existingTerritory.polygon_coords)
-      );
+      if (!Array.isArray(existing.polygonCoords) || existing.polygonCoords.length < 3) continue;
 
-      // Check if territories overlap
-      const hasOverlap = geoUtils.checkOverlap(newPolygon, existingPolygon);
-
-      if (hasOverlap) {
-        // Calculate overlapping area
-        const overlapArea = geoUtils.calculateOverlappingArea(newPolygon, existingPolygon);
-
-        // Update new territory (add overlap area)
-        const updatedNewArea = newTerritory.area + overlapArea;
-        await Territory.updatePolygon(newTerritory.id, newTerritory.polygon_coords, updatedNewArea);
-
-        // Update old territory (remove overlap area)
-        const updatedOldPolygon = geoUtils.subtractPolygon(existingPolygon, newPolygon);
-        const updatedOldArea = geoUtils.calculateArea(updatedOldPolygon);
-
-        // Get the polygon coordinates from the updated polygon
-        const oldPolygonCoords = updatedOldPolygon.geometry.coordinates[0].map(coord => [coord[1], coord[0]]);
-
-        await Territory.updatePolygon(existingTerritory.id, oldPolygonCoords, updatedOldArea);
-
-        // Update user statistics
-        const oldUserId = existingTerritory.user_id;
-
-        // Add overlap to new user's territory
-        await UserStatistics.updateTerritoryArea(newUserId, overlapArea);
-
-        // Remove overlap from old user's territory
-        await UserStatistics.updateTerritoryArea(oldUserId, -overlapArea);
-
-        // Log the conflict (optional)
-        logTerritoryConflict(existingTerritory.id, newTerritory.id, overlapArea, newUserId);
-
-        console.log(`Territory overlap handled: ${overlapArea} m² transferred from user ${oldUserId} to user ${newUserId}`);
+      let existingPolygon;
+      try {
+        existingPolygon = geoUtils.coordinatesToPolygon(existing.polygonCoords);
+      } catch (e) {
+        console.warn('⚠️ Could not parse existing territory polygon, skipping:', existing._id);
+        continue;
       }
+
+      const hasOverlap = geoUtils.checkOverlap(newPolygon, existingPolygon);
+      if (!hasOverlap) continue;
+
+      const overlapArea = geoUtils.calculateOverlappingArea(newPolygon, existingPolygon);
+      if (!overlapArea || overlapArea <= 0) continue;
+
+      console.log(`⚔️ Overlap detected: ${overlapArea.toFixed(2)} m² between new territory and territory ${existing._id}`);
+
+      // Subtract the new polygon from the old territory's polygon
+      const remainingPolygon = geoUtils.subtractPolygon(existingPolygon, newPolygon);
+
+      if (!remainingPolygon) {
+        // Entire old territory is consumed — delete it
+        await Territory.findByIdAndDelete(existing._id);
+        console.log(`🗑️ Territory ${existing._id} fully consumed and deleted`);
+
+        // Deduct entire old area from old owner's stats
+        await UserStatistics.findOneAndUpdate(
+          { userId: existing.userId },
+          { $inc: { totalTerritoryArea: -existing.area } }
+        );
+      } else {
+        // Partial overlap — update the old territory's polygon and area
+        const remainingCoords = remainingPolygon.geometry.coordinates[0].map(
+          coord => [coord[1], coord[0]]  // [lon, lat] → [lat, lon]
+        );
+        const remainingArea = geoUtils.calculateArea(remainingPolygon);
+        const newCenter = geoUtils.calculateCenterPoint(remainingPolygon);
+
+        await Territory.findByIdAndUpdate(existing._id, {
+          polygonCoords: remainingCoords,
+          area: remainingArea,
+          centerLat: newCenter.lat,
+          centerLon: newCenter.lon,
+        });
+
+        console.log(`✂️ Territory ${existing._id} trimmed. Remaining: ${remainingArea.toFixed(2)} m²`);
+
+        // Deduct overlap area from old owner's stats
+        await UserStatistics.findOneAndUpdate(
+          { userId: existing.userId },
+          { $inc: { totalTerritoryArea: -overlapArea } }
+        );
+      }
+
+      console.log(`✅ ${overlapArea.toFixed(2)} m² transferred from user ${existing.userId} to user ${newUserId}`);
     }
   } catch (error) {
-    console.error('Error handling territory overlap:', error);
+    console.error('❌ Error handling territory overlap:', error.message);
     throw error;
   }
 }
 
-/**
- * Log territory conflict to database for historical tracking
- * 
- * @param {number} territoryId1 - First territory ID
- * @param {number} territoryId2 - Second territory ID (the new one)
- * @param {number} overlapArea - Area of overlap in square meters
- * @param {number} newOwnerId - User ID who took over
- */
-async function logTerritoryConflict(territoryId1, territoryId2, overlapArea, newOwnerId) {
-  try {
-    const pool = require('../config/database');
-    await pool.query(
-      `INSERT INTO territory_conflicts (territory_id_1, territory_id_2, overlapping_area, new_owner_id)
-       VALUES ($1, $2, $3, $4)`,
-      [territoryId1, territoryId2, overlapArea, newOwnerId]
-    );
-  } catch (error) {
-    console.error('Error logging territory conflict:', error);
-  }
-}
-
-/**
- * Get all conflicts for a user
- * 
- * @param {number} userId - User ID
- * @returns {Array} Array of conflict records
- */
-async function getUserConflicts(userId) {
-  try {
-    const pool = require('../config/database');
-    const result = await pool.query(
-      `SELECT * FROM territory_conflicts 
-       WHERE new_owner_id = $1 
-       ORDER BY resolved_at DESC`,
-      [userId]
-    );
-    return result.rows;
-  } catch (error) {
-    console.error('Error fetching user conflicts:', error);
-    return [];
-  }
-}
-
-/**
- * Calculate total contested area for a user
- * (Area gained from conflicts)
- * 
- * @param {number} userId - User ID
- * @returns {number} Total contested area in square meters
- */
-async function getUserContestedArea(userId) {
-  try {
-    const pool = require('../config/database');
-    const result = await pool.query(
-      `SELECT SUM(overlapping_area) as total FROM territory_conflicts 
-       WHERE new_owner_id = $1`,
-      [userId]
-    );
-    return result.rows[0].total || 0;
-  } catch (error) {
-    console.error('Error calculating contested area:', error);
-    return 0;
-  }
-}
-
-module.exports = {
-  handleTerritoryOverlap,
-  logTerritoryConflict,
-  getUserConflicts,
-  getUserContestedArea,
-};
+module.exports = { handleTerritoryOverlap };

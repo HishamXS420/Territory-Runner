@@ -11,7 +11,6 @@ function logout() {
   window.location.href = '/login';
 }
 
-// Switch between leaderboards
 function switchLeaderboard(type) {
   currentLeaderboard = type;
   document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
@@ -21,7 +20,7 @@ function switchLeaderboard(type) {
   if (type === 'area') {
     metricHeader.textContent = 'Territory Area (m²)';
   } else {
-    metricHeader.textContent = 'Total Distance (m)';
+    metricHeader.textContent = 'Total Distance (km)';
   }
 
   loadLeaderboard();
@@ -31,8 +30,8 @@ function switchLeaderboard(type) {
 // Load leaderboard data
 async function loadLeaderboard() {
   try {
-    const endpoint = currentLeaderboard === 'area' 
-      ? '/api/leaderboard/area' 
+    const endpoint = currentLeaderboard === 'area'
+      ? '/api/leaderboard/area'
       : '/api/leaderboard/distance';
 
     const response = await axios.get(endpoint);
@@ -40,16 +39,16 @@ async function loadLeaderboard() {
 
     const tbody = document.getElementById('leaderboard-body');
     tbody.innerHTML = leaderboard.map((user, index) => {
-      const metric = currentLeaderboard === 'area' 
-        ? (user.total_territory_area || 0).toFixed(3)
-        : (user.total_distance || 0).toFixed(3);
+      const metric = currentLeaderboard === 'area'
+        ? (user.total_territory_area || 0).toFixed(2) + ' m²'
+        : (user.total_distance || 0).toFixed(3) + ' km';
 
       return `
         <tr>
           <td>${index + 1}</td>
-          <td>${user.username}</td>
+          <td>${user.username || 'Unknown'}</td>
           <td>${metric}</td>
-          <td>${user.total_running_sessions}</td>
+          <td>${user.total_running_sessions || 0}</td>
         </tr>
       `;
     }).join('');
